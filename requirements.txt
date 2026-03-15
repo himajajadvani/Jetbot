@@ -1,9 +1,26 @@
+# Core LangChain ecosystem
 langchain==1.2.10
-langgraph==1.0.10
-langchain-groq==1.1.2
+langchain-core==1.2.16
+langchain-groq
+langgraph
 
-fastapi[standard]==0.115.0
-pydantic==2.7.4
+# LLM Provider
+groq==0.37.1
 
-python-dotenv==1.0.1
-requests==2.32.3
+# Web framework 
+fastapi[standard]               
+
+# Streamlit UI 
+streamlit
+
+# HTTP client 
+requests
+
+# Data validation 
+pydantic
+
+# Environment variables 
+python-dotenv
+
+# Image processing 
+Pillow
