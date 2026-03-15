@@ -1,0 +1,9 @@
+langchain==1.2.10
+langgraph==1.0.10
+langchain-groq==1.1.2
+
+fastapi[standard]==0.115.0
+pydantic==2.7.4
+
+python-dotenv==1.0.1
+requests==2.32.3
