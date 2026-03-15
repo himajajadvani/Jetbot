@@ -5,8 +5,7 @@ from langgraph.checkpoint.memory import InMemorySaver
 
 from agent.prompts import SYSTEM_PROMPT
 from config.llm_config import groq_llm
-from tools.avinode_tool import search_flights, AMENITIES
-from results_cache import store_results
+from tools.avinode_tool import search_flights
 
 AMENITY_KEYWORDS = {
     "wifi":         "wifi",
@@ -76,7 +75,6 @@ def _build_enriched(user_input: str) -> str:
     amenities_str = extract_amenities(user_input)
     has_details   = _has_all_flight_details(user_input)
 
-    # Short conversational reply — no note needed, keeps tokens minimal
     is_conversational = (
         len(user_input.strip()) < 60
         and not amenities_str
@@ -109,28 +107,12 @@ def _build_enriched(user_input: str) -> str:
         return user_input
 
 
-def _cache_results_from_messages(session_id: str, messages: list):
-    try:
-        for msg in reversed(messages):
-            content = getattr(msg, "content", "")
-            if isinstance(content, str) and '"aircraft"' in content:
-                data     = json.loads(content)
-                aircraft = data.get("aircraft", [])
-                total    = data.get("total_results", len(aircraft))
-                if aircraft:
-                    store_results(session_id, aircraft, total)
-                break
-    except Exception:
-        pass
-
-
 def chat_with_agent(session_id: str, user_input: str) -> str:
     try:
         result = agent.invoke(
             {"messages": [{"role": "user", "content": _build_enriched(user_input)}]},
             {"configurable": {"thread_id": session_id}},
         )
-        _cache_results_from_messages(session_id, result.get("messages", []))
         return result["messages"][-1].content
     except Exception as e:
         return f"Error: {str(e)}"
@@ -138,19 +120,16 @@ def chat_with_agent(session_id: str, user_input: str) -> str:
 
 def stream_with_agent(session_id: str, user_input: str):
     try:
-        all_messages = []
         for token, metadata in agent.stream(
             {"messages": [{"role": "user", "content": _build_enriched(user_input)}]},
             {"configurable": {"thread_id": session_id}},
             stream_mode="messages",
         ):
-            all_messages.append(token)
             if (
                 metadata.get("langgraph_node") == "model"
                 and token.content
                 and isinstance(token.content, str)
             ):
                 yield token.content
-        _cache_results_from_messages(session_id, all_messages)
     except Exception as e:
         yield f"Error: {str(e)}"
