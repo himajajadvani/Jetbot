@@ -1,56 +1,11 @@
 import re
-import json
 from langchain.agents import create_agent
+from langchain.agents.middleware import ToolRetryMiddleware, ModelCallLimitMiddleware
 from langgraph.checkpoint.memory import InMemorySaver
 
 from agent.prompts import SYSTEM_PROMPT
 from config.llm_config import groq_llm
 from tools.avinode_tool import search_flights
-
-AMENITY_KEYWORDS = {
-    "wifi":         "wifi",
-    "wi-fi":        "wifi",
-    "wi fi":        "wifi",
-    "internet":     "wifi",
-    "catering":     "catering",
-    "food":         "catering",
-    "meal":         "catering",
-    "meals":        "catering",
-    "dining":       "catering",
-    "drinks":       "catering",
-    "vip lounge":   "vip_lounge",
-    "vip":          "vip_lounge",
-    "lounge":       "vip_lounge",
-    "hangar":       "hangar",
-    "hanger":       "hangar",
-    "storage":      "hangar",
-    "customs":      "customs",
-    "immigration":  "customs",
-    "pet friendly": "pet_friendly",
-    "pet-friendly": "pet_friendly",
-    "pets":         "pet_friendly",
-    "pet":          "pet_friendly",
-    "dog":          "pet_friendly",
-    "dogs":         "pet_friendly",
-    "cat":          "pet_friendly",
-    "gpu":          "gpu",
-    "ground power": "gpu",
-}
-
-WHOLE_WORD_ONLY = {"vip", "dog", "dogs", "pets", "pet", "cat", "gpu", "food", "meal", "meals", "storage"}
-
-
-def extract_amenities(text: str) -> str:
-    text_lower = text.lower()
-    found = set()
-    for keyword, key in AMENITY_KEYWORDS.items():
-        if keyword in WHOLE_WORD_ONLY:
-            if re.search(r'\b' + re.escape(keyword) + r'\b', text_lower):
-                found.add(key)
-        else:
-            if keyword in text_lower:
-                found.add(key)
-    return ",".join(sorted(found))
 
 
 def _has_all_flight_details(text: str) -> bool:
@@ -68,43 +23,41 @@ agent = create_agent(
     tools=[search_flights],
     checkpointer=checkpointer,
     system_prompt=SYSTEM_PROMPT,
+    middleware=[
+        ToolRetryMiddleware(
+            max_retries=3,
+            backoff_factor=2.0,
+            initial_delay=1.0,
+            tools=["search_flights"],
+            retry_on=(ConnectionError, TimeoutError),
+        ),
+        ModelCallLimitMiddleware(
+            thread_limit=30,
+            run_limit=10,
+            exit_behavior="end",
+        ),
+    ],
 )
 
 
 def _build_enriched(user_input: str) -> str:
-    amenities_str = extract_amenities(user_input)
-    has_details   = _has_all_flight_details(user_input)
+    has_details = _has_all_flight_details(user_input)
 
     is_conversational = (
         len(user_input.strip()) < 60
-        and not amenities_str
         and not has_details
     )
     if is_conversational:
         return user_input
 
-    if amenities_str and has_details:
-        return (
-            f"{user_input}\n\n"
-            f"[System note: all flight details and amenities provided. "
-            f"amenities detected = \"{amenities_str}\". "
-            f"Call search_flights immediately with these amenities. Do NOT ask any more questions.]"
-        )
-    elif amenities_str:
-        return (
-            f"{user_input}\n\n"
-            f"[System note: amenities detected = \"{amenities_str}\". "
-            f"Pass ONLY these amenities=\"{amenities_str}\" to search_flights. "
-            f"Do NOT add any other amenities not listed here.]"
-        )
-    elif has_details:
+    if has_details:
         return (
             f"{user_input}\n\n"
             f"[System note: user provided all flight details. "
-            f"Ask the amenities question ONE time, then call search_flights immediately after the user replies.]"
+            f"Call search_flights immediately. Do NOT ask any more questions.]"
         )
-    else:
-        return user_input
+
+    return user_input
 
 
 def chat_with_agent(session_id: str, user_input: str) -> str:
