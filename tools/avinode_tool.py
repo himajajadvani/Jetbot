@@ -4,6 +4,7 @@ import json
 import requests
 from langchain.tools import tool
 from typing import Union
+from currency import convert_all
 
 AVINODE_AUTH_TOKEN = os.getenv("AVINODE_AUTH_TOKEN")
 
@@ -13,16 +14,6 @@ _label_cache:   dict = {}
 
 
 def _coerce_bool(value) -> bool:
-    """
-    Safely coerce any value to bool.
-
-    Why this exists: LLMs (including Llama-4-Scout on Groq) sometimes serialise
-    Python True as the JSON string "true" when invoking tools, despite the system
-    prompt instructing them not to. LangChain's parameter coercion can also produce
-    strings. Without this guard, `if use_alternative_airport:` on the string "false"
-    evaluates to True (non-empty string), which is a silent correctness bug that
-    would show alternative airport results when the user never asked for them.
-    """
     if isinstance(value, bool): return value
     if isinstance(value, str):  return value.strip().lower() in ("true", "1", "yes")
     if isinstance(value, int):  return value != 0
@@ -65,8 +56,9 @@ def resolve_airports(city: str) -> list:
         )
         if r.status_code != 200: return []
         data = r.json().get("data", [])
-        # Only keep airports that have a usable code and Avinode ID
         usable = [d for d in data if d.get("code") and d.get("id")]
+        # Sort by quality score so index 0 is always the best airport, not Avinode's arbitrary order
+        usable = sorted(usable, key=_airport_score)
         for item in usable:
             code = (item.get("code") or "").strip().upper()
             if code:
@@ -78,14 +70,58 @@ def resolve_airports(city: str) -> list:
         return []
 
 
+_RESORT_NOISE = re.compile(
+    r'\b(resort|lodge|ranch|estate|golf|casino|spa|park|camp|'
+    r'private|helipad|heliport|strip|ultralight|seaplane|float)\b',
+    re.IGNORECASE
+)
+
+_MAJOR_KEYWORDS = re.compile(
+    r'\b(international|intl|national|charles|de gaulle|heathrow|gatwick|'
+    r'schiphol|frankfurt|orly|cointrin|linate|malpensa|fiumicino|barajas|'
+    r'zurich|geneva|milan|rome|madrid|dubai|doha|changi|narita|haneda)\b',
+    re.IGNORECASE
+)
+
+_IATA_RE = re.compile(r'^[A-Z]{3}$')
+
+
+def _airport_score(item: dict) -> int:
+    """Lower score = more preferred. Penalise resort/private strips; reward major international airports."""
+    score = 0
+    name    = (item.get("name") or item.get("airportName") or item.get("fullName") or "").strip()
+    city    = (item.get("cityName") or item.get("city") or "").strip()
+    country = (item.get("countryName") or item.get("country") or "").strip()
+    code    = (item.get("code") or "").strip().upper()
+    full    = f"{name} {city} {country}"
+
+    if _RESORT_NOISE.search(full):
+        score += 50                         # heavy penalty for resorts / private strips
+    if _MAJOR_KEYWORDS.search(full):
+        score -= 20                         # reward for known major hubs
+    if _IATA_RE.match(code):
+        score -= 10                         # standard 3-letter IATA = real commercial airport
+    elif len(code) == 4:
+        score += 5                          # 4-letter ICAO-only = smaller/private field
+    if country.lower() in ("united states", "us", "usa"):
+        score += 2                          # mild preference for international over US domestic
+
+    return score
+
+
 def resolve_airport(city: str):
-    """Return the top Avinode airport result for a city."""
+    """Return the best Avinode airport result for a city (prefers major intl over resorts)."""
     if not city: return None
     cache_key = city.lower().strip()
     if cache_key in _airport_cache and not cache_key.startswith("__list__"):
         return _airport_cache[cache_key]
     results = resolve_airports(city)
-    return results[0] if results else None
+    if not results:
+        return None
+    ranked = sorted(results, key=_airport_score)
+    best = ranked[0]
+    _airport_cache[cache_key] = best
+    return best
 
 
 def get_airport_label(code: str) -> str:
@@ -118,69 +154,68 @@ def get_airport_label(code: str) -> str:
 
 
 def filter_by_pax(hits: list, pax: int) -> list:
-    """
-    Filter aircraft by passenger count with a soft upper-cap to avoid
-    showing massively oversized aircraft (e.g. 30-seat jet for 5 people).
+    # Tier 1 — ideal fit: not oversized (maxPax between pax and pax×2)
+    ideal    = [h for h in hits if pax <= h.get("maxPax", 999) <= pax * 2]
+    # Tier 2 — relaxed: slightly larger jets (maxPax between pax×2 and pax×3)
+    relaxed  = [h for h in hits if pax * 2 < h.get("maxPax", 999) <= pax * 3]
+    # Tier 3 — fallback: anything that physically fits, no upper cap
+    fallback = [h for h in hits if h.get("maxPax", 999) > pax * 3 and pax <= h.get("maxPax", 999)]
 
-    Strategy (soft 2x multiplier with fallback):
-      1. Try: pax fits AND maxPax <= pax * 2  (ideal sizing)
-      2. If empty, try: pax fits AND maxPax <= pax * 3  (relaxed sizing)
-      3. If still empty, return all that physically fit (no upper cap)
-    """
-    def _fits(h, upper):
-        max_p = h.get("maxPax", 999)
-        return pax <= max_p <= upper
-
-    ideal = [h for h in hits if _fits(h, pax * 2)]
-    if ideal:
-        return ideal
-    relaxed = [h for h in hits if _fits(h, pax * 3)]
-    if relaxed:
-        return relaxed
-    return [h for h in hits if pax <= h.get("maxPax", 999)]
+    # Combine in priority order: best-fit first, oversized last
+    # This ensures perfectly sized jets are never discarded in favour of bigger ones
+    combined = ideal + relaxed + fallback
+    return combined
 
 
 def _is_turboprop(hit: dict) -> bool:
-    """
-    Detect turboprop/piston aircraft using Avinode's own category fields first,
-    then fall back to name-pattern matching for well-known models.
-    """
-    # Avinode category/type fields — most reliable
     for field in ("aircraftCategory", "category", "aircraftType", "type",
                   "categoryName", "typeName", "aircraftClass", "className"):
         val = (hit.get(field) or "").lower()
         if val and any(kw in val for kw in ("turbo", "turboprop", "prop")):
             return True
-    # Nested aircraft object
     for obj_key in ("aircraft", "aircraftInfo", "aircraftDetails"):
         for field in ("category", "type", "aircraftCategory", "aircraftType", "className"):
             val = ((hit.get(obj_key) or {}).get(field) or "").lower()
             if val and any(kw in val for kw in ("turbo", "turboprop", "prop")):
                 return True
-    # Name fallback — covers well-known turboprop models by product name
     name = (hit.get("uniqueName") or hit.get("aircraftName") or "").lower()
     return bool(re.search(
         r'\bturbo\b|\bturboprop\b|\bprop\b|'
         r'\bking.?air\b|\bpc.?12\b|\btbm\b|\bpilatus\b|'
         r'\bcaravan\b|\bkodiak\b|\bquest\b|'
         r'\bbeech.?1900\b|\batr\b|\bdash.?8\b|\bq400\b|'
-        r'\bsocata\b|\btbm.?9\b|\bpa.?46\b',
+        r'\bsocata\b|\btbm.?9\b|\bpa.?46\b|\bpiaggio\b|\bavanti\b',
         name
     ))
 
 
 def _select_top5(hits: list, pax: int) -> list:
     filtered = filter_by_pax(hits, pax)
-    def sort_key(h):
-        return (1 if _is_turboprop(h) else 0,
-                h.get("rawPrice") or h.get("originalRawPrice") or 999999)
-    return sorted(filtered, key=sort_key)[:5]
+
+    price_key  = lambda h: h.get("rawPrice") or h.get("originalRawPrice") or 999999
+    jets       = sorted([h for h in filtered if not _is_turboprop(h)], key=price_key)
+    turboprops = sorted([h for h in filtered if     _is_turboprop(h)], key=price_key)
+
+    # ── Selection Logic ───────────────────────────────────────────────────────
+    # If turboprops exist, we want the cheapest one to occupy slot #5.
+    # To do this, we MUST provide the top 4 jets first.
+    if turboprops:
+        # If we have at least 4 jets, take 4 + the turboprop (Total 5, TP is 5th)
+        if len(jets) >= 4:
+            return jets[:4] + [turboprops[0]]
+        # If we have fewer than 4 jets, just show all jets followed by the turboprop.
+        # Note: it will be in (len(jets)+1)th place, which is the "last" of the top results.
+        return jets + [turboprops[0]]
+    
+    # If no turboprops, just show top 5 jets.
+    return jets[:5]
 
 
 def clean_hit(hit: dict) -> dict:
     aircraft_name = (hit.get("uniqueName") or "").strip() or "Charter Aircraft"
     raw_price     = hit.get("rawPrice") or hit.get("originalRawPrice") or 0
     price_str     = f"${raw_price:,.0f} USD" if raw_price else hit.get("price", "N/A")
+    prices        = convert_all(float(raw_price)) if raw_price else {}
     capacity      = f"{hit.get('minPax', 1)}-{hit.get('maxPax', '?')} passengers"
 
     segments = hit.get("segments") or []
@@ -221,10 +256,11 @@ def clean_hit(hit: dict) -> dict:
         "aircraft_name":     aircraft_name,
         "capacity":          capacity,
         "price_usd":         price_str,
+        "prices":            prices,
         "flight_time":       flight_time,
         "departure_airport": dep_label or "Unknown",
         "arrival_airport":   arr_label or "Unknown",
-        "is_turbo_prop":     _is_turboprop(hit),
+        "is_turbo":          _is_turboprop(hit),
     }
 
 
@@ -243,6 +279,7 @@ def search_flights(
     use_alternative_airport: boolean — true only when user explicitly asked for
       alternative airport options. Also accepts "true"/"false" strings safely via _coerce_bool.
     Returns top 5 results: jets cheapest-first, turboprops listed last.
+    Each aircraft includes a 'prices' dict with conversions for USD, INR, EUR, GBP, CHF, AED, JPY, CAD, AUD.
     """
     use_alt = _coerce_bool(use_alternative_airport)
 
@@ -254,7 +291,6 @@ def search_flights(
     dep_list  = resolve_airports(departure_city)
     dest_list = resolve_airports(destination_city)
 
-    # Fallback if city search fails but input looks like a raw airport code
     if not dep_list and re.match(r'^[A-Za-z]{3,4}$', departure_city.strip()):
         single = resolve_airport(departure_city.strip().upper())
         dep_list = [single] if single else []
@@ -267,10 +303,15 @@ def search_flights(
     if not dest_list:
         return json.dumps({"error": f"Could not resolve arrival airport for '{destination_city}'."})
 
-    dep  = dep_list[1 if (use_alt and len(dep_list) > 1) else 0]
-    dest = dest_list[0]
+    # ── Airport selection ─────────────────────────────────────────────────────
+    # When use_alt=True: pick dep_list[1] if available, dest_list[1] if available.
+    # Falls back to index 0 for whichever side has no alternative.
+    has_alt_dep  = len(dep_list)  > 1
+    has_alt_dest = len(dest_list) > 1
 
-    # ── Main search ───────────────────────────────────────────────────────────
+    dep  = dep_list [1 if (use_alt and has_alt_dep)  else 0]
+    dest = dest_list[1 if (use_alt and has_alt_dest) else 0]
+
     payload = {"segments": [{
         "startAirportId":          int(dep["id"]),
         "startAirportSearch":      dep["code"],
@@ -309,18 +350,25 @@ def search_flights(
         if dst_label and ac["arrival_airport"]   in ("", dest.get("code", ""), "Unknown"):
             ac["arrival_airport"] = dst_label
 
-    # ── Alternative airport: only offer if it actually has results ────────────
-    dep_has_real_alt = False
-    alt_label        = ""
+    # ── Probe for alternative airports (only on the primary search) ───────────
+    # Logic:
+    #   Both alt dep + alt dest exist → probe dep_list[1] → dest_list[1]
+    #   Only alt dep exists           → probe dep_list[1] → dest_list[0]  (original dest)
+    #   Only alt dest exists          → probe dep_list[0] → dest_list[1]  (original dep)
+    #   Neither exists                → no probe, no offer
+    alt_available     = False
+    alt_dep_label     = ""
+    alt_dest_label    = ""
 
-    if not use_alt and len(dep_list) > 1:
-        alt = dep_list[1]
+    if not use_alt and (has_alt_dep or has_alt_dest):
+        probe_dep  = dep_list [1 if has_alt_dep  else 0]
+        probe_dest = dest_list[1 if has_alt_dest else 0]
         try:
             alt_payload = {"segments": [{
-                "startAirportId":          int(alt["id"]),
-                "startAirportSearch":      alt["code"],
-                "endAirportId":            int(dest["id"]),
-                "endAirportSearch":        dest["code"],
+                "startAirportId":          int(probe_dep["id"]),
+                "startAirportSearch":      probe_dep["code"],
+                "endAirportId":            int(probe_dest["id"]),
+                "endAirportSearch":        probe_dest["code"],
                 "date":                    date,
                 "time":                    "09:00",
                 "paxCount":                str(pax_int),
@@ -333,15 +381,21 @@ def search_flights(
             if alt_resp.status_code == 200:
                 alt_hits = alt_resp.json().get("data", {}).get("searchHits", [])
                 if filter_by_pax(alt_hits, pax_int):
-                    dep_has_real_alt = True
-                    alt_label = _build_label(alt, (alt.get("code") or "").strip().upper())
+                    alt_available  = True
+                    # Only populate the label for whichever side actually changed
+                    if has_alt_dep:
+                        alt_dep_label  = _build_label(probe_dep,  (probe_dep.get("code")  or "").strip().upper())
+                    if has_alt_dest:
+                        alt_dest_label = _build_label(probe_dest, (probe_dest.get("code") or "").strip().upper())
         except Exception:
             pass
 
     return json.dumps({
-        "total_results":                 len(cleaned),
-        "used_departure_airport":        dep_label or dep.get("code", departure_city),
-        "alternative_airport_available": dep_has_real_alt,
-        "alternative_departure_airport": alt_label,
-        "aircraft":                      cleaned,
+        "total_results":                  len(cleaned),
+        "used_departure_airport":         dep_label or dep.get("code", departure_city),
+        "used_arrival_airport":           dst_label or dest.get("code", destination_city),
+        "alternative_airport_available":  alt_available,
+        "alternative_departure_airport":  alt_dep_label,   # empty string if dep didn't change
+        "alternative_arrival_airport":    alt_dest_label,  # empty string if dest didn't change
+        "aircraft":                       cleaned,
     }, indent=2)
