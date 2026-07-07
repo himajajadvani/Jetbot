@@ -3,4 +3,7 @@
 __pycache__/
 venv/
 *.pyc
-results_cache.py
+
+# Local files not to be uploaded to GitHub
+start.bat
+exchangerate.txt
